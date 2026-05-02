@@ -8,7 +8,23 @@ from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.agents.ppo import PPOTrainer
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.models import ModelCatalog
+from ray.rllib.agents.callbacks import DefaultCallbacks
+from ray.tune.logger import UnifiedLogger
 from THE_CHOSEN_ONE_AGENT.model import PPOGeneralistNetwork
+
+class TeamTrackerCallback(DefaultCallbacks):
+    def on_episode_end(self, *, worker, base_env, policies, episode, env_index, **kwargs):
+        team_a_reward = 0.0
+        team_b_reward = 0.0
+
+        for (agent_id, policy_id), reward in episode.agent_rewards.items():
+            if agent_id in [0, 1]:
+                team_a_reward += reward
+            elif agent_id in [2, 3]:
+                team_b_reward += reward
+
+        episode.custom_metrics["team_a_reward"] = team_a_reward
+        episode.custom_metrics["team_b_reward"] = team_b_reward
 
 class TrainingSoccerWrapper(MultiAgentEnv):
     """Handles Observation Engineering and Reward Shaping during training."""
@@ -76,6 +92,25 @@ class TrainingSoccerWrapper(MultiAgentEnv):
 
         return obs, shaped_rewards, dones, infos
 
+class BaselineSoccerWrapper(MultiAgentEnv):
+    """A minimal wrapper that passes through environment data with NO reward shaping."""
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def step(self, action_dict):
+        obs, rewards, dones, infos = self.env.step(action_dict)
+
+        if "__all__" not in dones:
+            dones["__all__"] = all(dones.values()) if dones else False
+
+        return obs, rewards, dones, infos
+
 class RLlibAdapterModel(TorchModelV2, torch.nn.Module):
     """Wraps our clean PyTorch model so RLlib can use it to train."""
     def __init__(self, obs_space, action_space, num_outputs, model_config, name):
@@ -101,9 +136,12 @@ def policy_mapping_fn(agent_id, episode, worker, **kwargs):
     return "shared_policy"
 
 def env_creator(env_config):
-    worker_index = env_config.worker_index if hasattr(env_config, "worker_index") else 0
+    worker_idx = env_config.worker_index if hasattr(env_config, "worker_index") else 0
+    vector_idx = env_config.vector_index if hasattr(env_config, "vector_index") else 0
+    unique_worker_id = worker_idx * 100 + vector_idx
+
     raw_env = soccer_twos.make(
-        worker_id=worker_index, 
+        worker_id=unique_worker_id,
         render=False, 
         watch=False
     )
@@ -116,6 +154,7 @@ if __name__ == "__main__":
     config = {
         "env": "SoccerWrapped",
         "framework": "torch",
+        "num_gpus": 1,
         "disable_env_checking": True,
         "multiagent": {
             "policies": {
@@ -124,13 +163,25 @@ if __name__ == "__main__":
             "policy_mapping_fn": policy_mapping_fn,
         },
         "model": {"custom_model": "generalist_adapter"},
-        "num_workers": 2,
-        "num_envs_per_worker": 1,
+        "callbacks": TeamTrackerCallback,
+        "num_workers": 10,
+        "num_envs_per_worker": 2,
+        "train_batch_size": 10000,
+        "sgd_minibatch_size": 2048,
+        "rollout_fragment_length": 500,
+        "num_gpus_per_worker": 0
     }
 
-    trainer = PPOTrainer(config=config)
+    # Define a custom folder name for your logs
+    LOG_DIR = os.path.join(os.getcwd(), "training_logs")
 
-    target_timesteps = 15_000_000
+    def custom_logger_creator(config):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        return UnifiedLogger(config, LOG_DIR, loggers=None)
+
+    trainer = PPOTrainer(config=config, logger_creator=custom_logger_creator)
+
+    target_timesteps = 10_000_000
     total_timesteps = 0
     iteration = 0
     
@@ -140,13 +191,15 @@ if __name__ == "__main__":
         result = trainer.train()
         total_timesteps = result["timesteps_total"]
         iteration += 1
-        shared_reward = result['policy_reward_mean'].get('shared_policy', 0)
+
+        team_a_mean = result["custom_metrics"].get("team_a_reward_mean", 0)
+        team_b_mean = result["custom_metrics"].get("team_b_reward_mean", 0)
+
         print(f"Iter {iteration} | Steps: {total_timesteps:,}/{target_timesteps:,} | "
-              f"Shared Reward: {shared_reward:.2f}")
+              f"Team A Reward: {team_a_mean:.2f} | Team B Reward: {team_b_mean:.2f}")
 
         if iteration % 50 == 0:
             weights = trainer.get_policy("shared_policy").model.core_network.state_dict()
-            
             torch.save(weights, f"backup_checkpoints/shared_iter_{iteration}.pth")
             print(f"--> Saved safe backup at {total_timesteps:,} steps!")
 
@@ -154,7 +207,7 @@ if __name__ == "__main__":
 
     final_weights = trainer.get_policy("shared_policy").model.core_network.state_dict()
     os.makedirs("THE_CHOSEN_ONE_AGENT", exist_ok=True)
-    torch.save(final_weights, "THE_CHOSEN_ONE_AGENT/checkpoint_shared.pth")
+    torch.save(final_weights, "THE_CHOSEN_ONE_AGENT/shared_checkpoint.pth")
     
     print("Exported raw PyTorch weights successfully!")
     ray.shutdown()

@@ -20,7 +20,9 @@ class TeamAgent(AgentInterface):
         model_path = os.path.join(base_dir, "shared_checkpoint.pth")
 
         if os.path.isfile(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model.load_state_dict(torch.load(model_path, map_location=device))
+            self.model.to(device)
         else:
             print("WARNING: Checkpoints not found. Agents will act randomly.")
 
@@ -34,9 +36,10 @@ class TeamAgent(AgentInterface):
             actions: dict {player_id: action_array}
         """
         actions = {}
+        device = next(self.model.parameters()).device
 
         for player_id, obs in observation.items():
-            state_tensor = torch.from_numpy(obs).float().unsqueeze(0)
+            state_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(device)
             
             with torch.no_grad():
                 action_tensor = self.model.forward_actor(state_tensor)
